@@ -50,9 +50,12 @@ const unsigned long GATE_WAIT_TIMEOUT = 5000;
 const unsigned long GATE_CHECK_INTERVAL = 50;
 const unsigned long GATE_CLEAR_STABLE_TIME = 500;
 
-// Cấu hình mức tín hiệu của cảm biến.
-const int GATE_SENSOR_ACTIVE_STATE = LOW;
-const int SLOT_EMPTY_STATE = HIGH;
+// Cấu hình mức tín hiệu của cảm biến IR.
+// Cảm biến IR hoạt động:
+//   - Bình thường (không có vật): Tín hiệu HIGH (mức cao)
+//   - Có vật che (xe đi qua): Tín hiệu LOW (mức thấp)
+const int GATE_SENSOR_ACTIVE_STATE = LOW;   // LOW = Có xe tại cổng
+const int SLOT_EMPTY_STATE = HIGH;          // HIGH = Slot trống (không có xe)
 
 // Danh sách UID thẻ được phép vào bãi (thẻ master) - THAY ĐỔI THEO THẺ THẬT!
 // HƯỚNG DẪN: Quét từng thẻ RFID → Xem UID trên Serial Monitor → Thay vào đây
@@ -64,8 +67,8 @@ String checkedInUIDs[4] = {"", "", "", ""};  // Tối đa 4 xe (theo số slot)
 int checkedInCount = 0;
 
 // Thong tin WiFi
-const char* ssid = "Quang Vinh";
-const char* password = "0978020252";
+const char* ssid = "VIETTEL_xsb2Tc";
+const char* password = "hzyqgphx";
 const unsigned long WIFI_CONNECT_TIMEOUT = 15000;//ms
 
 void printESP32MacAddress() {
@@ -82,10 +85,15 @@ void printESP32MacAddress() {
  * MỤC ĐÍCH: Kiểm tra có xe đang ở cổng không
  * THAM SỐ: sensorPin - chân cảm biến IR cần kiểm tra
  * TRẢ VỀ: true = có xe, false = không có xe
+ * CÁCH HOẠT ĐỘNG:
+ *   - Cảm biến IR bình thường (không vật): HIGH (mức cao)
+ *   - Có xe che cảm biến: LOW (mức thấp)
+ *   - So sánh với GATE_SENSOR_ACTIVE_STATE (LOW)
+ *   - Nếu bằng LOW → true (có xe)
  * VÍ DỤ: if (isVehicleDetected(IR_GATE_IN)) { ... }
  */
 bool isVehicleDetected(int sensorPin) {
-  return digitalRead(sensorPin) == GATE_SENSOR_ACTIVE_STATE;
+  return digitalRead(sensorPin) == GATE_SENSOR_ACTIVE_STATE;  // LOW = có xe
 }
 
 /*
@@ -93,10 +101,15 @@ bool isVehicleDetected(int sensorPin) {
  * MỤC ĐÍCH: Kiểm tra slot đỗ xe có trống không
  * THAM SỐ: sensorPin - chân cảm biến IR của slot
  * TRẢ VỀ: true = slot trống, false = có xe đỗ
+ * CÁCH HOẠT ĐỘNG:
+ *   - Cảm biến IR bình thường (không vật): HIGH (mức cao)
+ *   - Có xe đỗ che cảm biến: LOW (mức thấp)
+ *   - So sánh với SLOT_EMPTY_STATE (HIGH)
+ *   - Nếu bằng HIGH → true (slot trống)
  * VÍ DỤ: if (isSlotEmpty(IR1)) { ... }
  */
 bool isSlotEmpty(int sensorPin) {
-  return digitalRead(sensorPin) == SLOT_EMPTY_STATE;
+  return digitalRead(sensorPin) == SLOT_EMPTY_STATE;  // HIGH = slot trống
 }
 
 /*
@@ -336,7 +349,7 @@ void loop() {
 String readUID() {
   String uid = "";
 
-  // Duyệt qua từng byte của UID
+  // Duyệt qua từng byte của UID 4byte
   for (byte i = 0; i < rfid.uid.size; i++) {
     // Nếu byte < 16 (0x10) thì thêm số 0 phía trước
     // Ví dụ: 5 → "05", 15 → "0F" (đảm bảo 2 ký tự)
@@ -345,7 +358,7 @@ String readUID() {
     }
     // Chuyển byte sang HEX và nối vào chuỗi
     // Ví dụ: 161 → "A1", 255 → "FF"
-    uid += String(rfid.uid.uidByte[i], HEX);
+    uid += String(rfid.uid.uidByte[i], HEX);//549D0F7C
   }
 
   // Chuyển toàn bộ về chữ thường để dễ so sánh
