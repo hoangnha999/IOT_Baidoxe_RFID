@@ -14,7 +14,7 @@
 
 // ================= RFID RC522 =================
 #define SS_PIN 5
-#define RST_PIN 4
+#define RST_PIN UINT8_MAX  // RST noi thang 3.3V, khong dung GPIO
 MFRC522 rfid(SS_PIN, RST_PIN);
 
 // ================= SERVO =================
@@ -195,11 +195,17 @@ void readSHT31() {
   temperature = sht31.readTemperature();
   humidity = sht31.readHumidity();
   
-  // Kiểm tra lỗi đọc
+  // Kiểm tra lỗi đọc (chỉ in lỗi 1 lần, không spam)
+  static bool errorPrinted = false;
   if (isnan(temperature) || isnan(humidity)) {
-    Serial.println("⚠️ Lỗi đọc SHT31!");
+    if (!errorPrinted) {
+      Serial.println("⚠️ Lỗi đọc SHT31! Kiểm tra kết nối I2C.");
+      errorPrinted = true;
+    }
     temperature = 0.0;
     humidity = 0.0;
+  } else {
+    errorPrinted = false;  // Reset khi đọc thành công
   }
 }
 
@@ -224,15 +230,36 @@ void readAllSensors() {
   readSHT31();
   readMQ2();
   
-  // In ra Serial để debug
-  Serial.print("🌡️ Nhiệt độ: ");
-  Serial.print(temperature, 1);
-  Serial.print("°C | Độ ẩm: ");
-  Serial.print(humidity, 1);
-  Serial.print("% | Khói: ");
-  Serial.print(smokeLevel);
-  if (fireAlarm) Serial.print(" ⚠️ NGUY HIỂM!");
-  Serial.println();
+  // Chỉ in khi có thay đổi đáng kể hoặc cảnh báo (tránh spam Serial Monitor)
+  static float lastPrintTemp = -999;
+  static float lastPrintHumi = -999;
+  static int lastPrintSmoke = -999;
+  static bool lastPrintFireAlarm = false;
+  static unsigned long lastPrintTime = 0;
+  
+  bool tempChanged = abs(temperature - lastPrintTemp) >= 1.0;     // Thay đổi >= 1°C
+  bool humiChanged = abs(humidity - lastPrintHumi) >= 5.0;        // Thay đổi >= 5%
+  bool smokeChanged = abs(smokeLevel - lastPrintSmoke) >= 100;    // Thay đổi >= 100
+  bool fireChanged = (fireAlarm != lastPrintFireAlarm);
+  bool timeToPrint = (millis() - lastPrintTime >= 30000);         // In mỗi 30s
+  
+  // Chỉ in khi: có thay đổi đáng kể, có cảnh báo cháy, hoặc đã lâu chưa in
+  if (tempChanged || humiChanged || smokeChanged || fireChanged || fireAlarm || timeToPrint) {
+    Serial.print("🌡️ Nhiệt độ: ");
+    Serial.print(temperature, 1);
+    Serial.print("°C | Độ ẩm: ");
+    Serial.print(humidity, 1);
+    Serial.print("% | Khói: ");
+    Serial.print(smokeLevel);
+    if (fireAlarm) Serial.print(" ⚠️ NGUY HIỂM!");
+    Serial.println();
+    
+    lastPrintTemp = temperature;
+    lastPrintHumi = humidity;
+    lastPrintSmoke = smokeLevel;
+    lastPrintFireAlarm = fireAlarm;
+    lastPrintTime = millis();
+  }
 }
 
 // ================= RTC & MQTT =================
@@ -475,6 +502,8 @@ void setup() {
 
   SPI.begin();
   rfid.PCD_Init();
+  Serial.print("RFID firmware: ");
+  rfid.PCD_DumpVersionToSerial();  // In phiên bản RC522, nếu thấy 0x00 hoặc 0xFF là lỗi kết nối
 
   servoIn.attach(SERVO_IN_PIN);
   servoOut.attach(SERVO_OUT_PIN);
@@ -553,12 +582,27 @@ void loop() {
     return;
   }
 
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
+  // Reset RC522 dinh ky de tranh bi dong bang
+  static unsigned long lastRfidReset = 0;
+  static int noCardCount = 0;
+  if (!rfid.PICC_IsNewCardPresent()) {
+    noCardCount++;
+    if (noCardCount >= 20) {  // Sau ~1s khong co the → reset
+      noCardCount = 0;
+      rfid.PCD_Init();
+    }
     return;
+  }
+  noCardCount = 0;
+  if (!rfid.PICC_ReadCardSerial()) {
+    rfid.PCD_Init();  // Reset neu doc that bai
+    return;
+  }
 
   String uid = readUID();
   Serial.print("The quet: ");
   Serial.println(uid);
+  beepSuccess();  // Beep mỗi khi đọc thẻ thành công
 
   if (isVehicleDetected(IR_GATE_OUT)) {
     // CỔNG RA
@@ -572,23 +616,8 @@ void loop() {
     }
     
   } else if (isVehicleDetected(IR_GATE_IN)) {
-    // === CỔNG VÀO: Kiểm tra thẻ hợp lệ (master) và có chỗ trống ===
-    if (slotAvailable > 0) {
-      if (isValidUID(uid)) {
-        if (checkInUID(uid)) {  // Lưu UID vào danh sách check-in
-          beepSuccess();  // Báo hiệu thành công
-          openGateIn();
-        } else {
-          beepWarning();  // Thẻ đã vào rồi
-        }
-      } else {
-        beepError();  // Báo hiệu lỗi
-        Serial.println("❌ The khong hop le!");
-      }
-    } else {
-      beepWarning();  // Cảnh báo hết chỗ
-      Serial.println("❌ Het cho!");
-    }
+    // === CỔNG VÀO: Đọc được thẻ là mở ===
+    openGateIn();
   }
   // Lưu ý: Không cần else để báo lỗi khi không có xe ở cổng
   // → Cho phép người dùng quét thẻ trước rồi mới lái xe vào
