@@ -14,7 +14,7 @@
 
 // ================= RFID RC522 =================
 #define SS_PIN 5
-#define RST_PIN UINT8_MAX  // RST noi thang 3.3V, khong dung GPIO
+#define RST_PIN 16  // Chan reset RFID
 MFRC522 rfid(SS_PIN, RST_PIN);
 
 // ================= SERVO =================
@@ -50,6 +50,27 @@ int smokeLevel = 0;
 bool fireAlarm = false;  // Cảnh báo cháy
 
 const int SMOKE_THRESHOLD = 400;  // Ngưỡng cảnh báo khói (0-4095)
+
+// ================= STATE MACHINE =================
+enum GateState {
+  STATE_IDLE = 0,                    // Trạng thái chờ
+  STATE_ENTRY_CARD_DETECTED = 1,     // Phát hiện thẻ ở cổng vào
+  STATE_ENTRY_GATE_OPENING = 2,      // Đang mở cổng vào
+  STATE_ENTRY_VEHICLE_PASSING = 3,   // Xe đang đi qua cổng vào
+  STATE_BARRIER_PASSING = 4,         // Xe đang đi qua thanh ngang (barrier)
+  STATE_EXIT_CARD_DETECTED = 5,      // Phát hiện thẻ ở cổng ra
+  STATE_EXIT_GATE_OPENING = 6,       // Đang mở cổng ra
+  STATE_EXIT_VEHICLE_PASSING = 7     // Xe đang đi qua cổng ra
+};
+
+GateState currentState = STATE_IDLE;
+GateState entryState = STATE_IDLE;     // Trạng thái riêng cho cổng vào
+GateState exitState = STATE_IDLE;      // Trạng thái riêng cho cổng ra
+
+String currentUID = "";                // UID thẻ hiện tại
+unsigned long stateStartTime = 0;      // Thời điểm bắt đầu trạng thái
+unsigned long entryStateStartTime = 0;
+unsigned long exitStateStartTime = 0;
 
 // Biến lưu giá trị cũ để so sánh thay đổi (tránh spam MQTT)
 float lastTemp = -999.0;
@@ -89,8 +110,8 @@ VehicleInfo parkedVehicles[4];
 int checkedInCount = 0;
 
 // WiFi
-const char* ssid = "VIETTEL_xsb2Tc";
-const char* password = "hzyqgphx";
+const char* ssid = "vivo Y21s";
+const char* password = "0354167047";
 const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
 
 // MQTT & RTC
@@ -502,8 +523,11 @@ void setup() {
 
   SPI.begin();
   rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);  // Tang gain anten toi da cho chip clone
   Serial.print("RFID firmware: ");
-  rfid.PCD_DumpVersionToSerial();  // In phiên bản RC522, nếu thấy 0x00 hoặc 0xFF là lỗi kết nối
+  rfid.PCD_DumpVersionToSerial();
+  Serial.print("Antenna gain: ");
+  Serial.println(rfid.PCD_GetAntennaGain(), HEX);
 
   servoIn.attach(SERVO_IN_PIN);
   servoOut.attach(SERVO_OUT_PIN);
@@ -549,6 +573,258 @@ void setup() {
   Serial.println("✓ San sang!");
 }
 
+// ================= STATE MACHINE FUNCTIONS =================
+
+/*
+ * TRẠNG THÁI 1: Phát hiện thẻ ở cổng vào
+ */
+void handleEntryCardDetected() {
+  Serial.println("[STATE 1] Phat hien the o cong vao");
+  
+  // Kiểm tra xe đã có ở cổng vào chưa
+  if (isVehicleDetected(IR_GATE_IN)) {
+    Serial.println("✅ Xe da o cong vao, chuyen sang mo cong");
+    entryState = STATE_ENTRY_GATE_OPENING;
+    entryStateStartTime = millis();
+  } else {
+    // Chờ xe đến cổng (timeout 5s)
+    if (millis() - entryStateStartTime > 5000) {
+      Serial.println("⏱️ Timeout - Khong thay xe, quay lai IDLE");
+      entryState = STATE_IDLE;
+      currentUID = "";
+    }
+  }
+}
+
+/*
+ * TRẠNG THÁI 2: Đang mở cổng vào
+ */
+void handleEntryGateOpening() {
+  Serial.println("[STATE 2] Dang mo cong vao");
+  servoIn.write(GATE_OPEN_ANGLE);
+  beepSuccess();
+  
+  // Check-in xe khi mở cổng
+  if (!isCheckedIn(currentUID)) {
+    checkInUID(currentUID);
+  }
+  
+  // Chuyển sang trạng thái 3
+  entryState = STATE_ENTRY_VEHICLE_PASSING;
+  entryStateStartTime = millis();
+}
+
+/*
+ * TRẠNG THÁI 3: Xe đang đi qua cổng vào
+ */
+void handleEntryVehiclePassing() {
+  Serial.println("[STATE 3] Xe dang di qua cong vao");
+  
+  // Đợi xe đi qua hoàn toàn
+  static unsigned long clearStart = 0;
+  
+  if (isVehicleDetected(IR_GATE_IN)) {
+    clearStart = 0;  // Reset bộ đếm khi còn phát hiện xe
+    Serial.print(".");  // In dấu chấm để thấy đang chờ
+  } else {
+    // Xe đã qua, bắt đầu đếm thời gian ổn định
+    if (clearStart == 0) {
+      clearStart = millis();
+    }
+    
+    // Chờ 500ms ổn định trước khi đóng cổng
+    if (millis() - clearStart >= GATE_CLEAR_STABLE_TIME) {
+      Serial.println("\n✅ Xe da qua cong vao hoan toan");
+      
+      // Chuyển sang TRẠNG THÁI 4: Xe đang đi qua thanh ngang
+      entryState = STATE_BARRIER_PASSING;
+      entryStateStartTime = millis();
+      clearStart = 0;
+    }
+  }
+  
+  // Timeout 10s
+  if (millis() - entryStateStartTime > 10000) {
+    Serial.println("\n⏱️ Timeout - Dong cong vao");
+    servoIn.write(GATE_CLOSE_ANGLE);
+    entryState = STATE_IDLE;
+    currentUID = "";
+  }
+}
+
+/*
+ * TRẠNG THÁI 4: Xe đang đi qua thanh ngang (barrier)
+ * Đây là trạng thái chờ xe hoàn toàn vào bãi sau khi qua cổng
+ */
+void handleBarrierPassing() {
+  Serial.println("[STATE 4] Xe dang di qua thanh ngang (barrier)");
+  
+  // Đóng cổng vào sau khi xe đã qua
+  servoIn.write(GATE_CLOSE_ANGLE);
+  Serial.println("🚪 Dong cong vao");
+  
+  // Chờ 2 giây để xe đi vào bãi hoàn toàn
+  if (millis() - entryStateStartTime >= 2000) {
+    Serial.println("✅ Xe da vao bai hoan toan");
+    
+    // Quay về trạng thái chờ
+    entryState = STATE_IDLE;
+    currentUID = "";
+    
+    // Cập nhật số slot trống
+    updateSlot();
+  }
+}
+
+/*
+ * TRẠNG THÁI 5: Phát hiện thẻ ở cổng ra
+ */
+void handleExitCardDetected() {
+  Serial.println("[STATE 5] Phat hien the o cong ra");
+  
+  // Kiểm tra xe đã check-in chưa
+  if (!isCheckedIn(currentUID)) {
+    beepError();
+    Serial.println("❌ The chua check-in! Khong cho ra");
+    exitState = STATE_IDLE;
+    currentUID = "";
+    return;
+  }
+  
+  // Kiểm tra xe đã có ở cổng ra chưa
+  if (isVehicleDetected(IR_GATE_OUT)) {
+    Serial.println("✅ Xe da o cong ra, chuyen sang mo cong");
+    exitState = STATE_EXIT_GATE_OPENING;
+    exitStateStartTime = millis();
+  } else {
+    // Chờ xe đến cổng (timeout 5s)
+    if (millis() - exitStateStartTime > 5000) {
+      Serial.println("⏱️ Timeout - Khong thay xe, quay lai IDLE");
+      exitState = STATE_IDLE;
+      currentUID = "";
+    }
+  }
+}
+
+/*
+ * TRẠNG THÁI 6: Đang mở cổng ra
+ */
+void handleExitGateOpening() {
+  Serial.println("[STATE 6] Dang mo cong ra");
+  servoOut.write(GATE_OPEN_ANGLE);
+  beepSuccess();
+  
+  // Chuyển sang trạng thái 7
+  exitState = STATE_EXIT_VEHICLE_PASSING;
+  exitStateStartTime = millis();
+}
+
+/*
+ * TRẠNG THÁI 7: Xe đang đi qua cổng ra
+ */
+void handleExitVehiclePassing() {
+  Serial.println("[STATE 7] Xe dang di qua cong ra");
+  
+  // Đợi xe đi qua hoàn toàn
+  static unsigned long clearStart = 0;
+  
+  if (isVehicleDetected(IR_GATE_OUT)) {
+    clearStart = 0;  // Reset bộ đếm khi còn phát hiện xe
+    Serial.print(".");
+  } else {
+    // Xe đã qua, bắt đầu đếm thời gian ổn định
+    if (clearStart == 0) {
+      clearStart = millis();
+    }
+    
+    // Chờ 500ms ổn định trước khi đóng cổng
+    if (millis() - clearStart >= GATE_CLEAR_STABLE_TIME) {
+      Serial.println("\n✅ Xe da qua cong ra hoan toan");
+      
+      // Đóng cổng ra
+      servoOut.write(GATE_CLOSE_ANGLE);
+      Serial.println("🚪 Dong cong ra");
+      
+      // Check-out xe
+      checkOutUID(currentUID);
+      
+      // Quay về trạng thái chờ
+      exitState = STATE_IDLE;
+      currentUID = "";
+      clearStart = 0;
+      
+      // Cập nhật số slot trống
+      updateSlot();
+    }
+  }
+  
+  // Timeout 10s
+  if (millis() - exitStateStartTime > 10000) {
+    Serial.println("\n⏱️ Timeout - Dong cong ra");
+    servoOut.write(GATE_CLOSE_ANGLE);
+    exitState = STATE_IDLE;
+    currentUID = "";
+  }
+}
+
+/*
+ * XỬ LÝ MÁY TRẠNG THÁI CỔNG VÀO
+ */
+void processEntryStateMachine() {
+  switch (entryState) {
+    case STATE_IDLE:
+      // Không làm gì, chờ thẻ
+      break;
+      
+    case STATE_ENTRY_CARD_DETECTED:
+      handleEntryCardDetected();
+      break;
+      
+    case STATE_ENTRY_GATE_OPENING:
+      handleEntryGateOpening();
+      break;
+      
+    case STATE_ENTRY_VEHICLE_PASSING:
+      handleEntryVehiclePassing();
+      break;
+      
+    case STATE_BARRIER_PASSING:
+      handleBarrierPassing();
+      break;
+      
+    default:
+      entryState = STATE_IDLE;
+      break;
+  }
+}
+
+/*
+ * XỬ LÝ MÁY TRẠNG THÁI CỔNG RA
+ */
+void processExitStateMachine() {
+  switch (exitState) {
+    case STATE_IDLE:
+      // Không làm gì, chờ thẻ
+      break;
+      
+    case STATE_EXIT_CARD_DETECTED:
+      handleExitCardDetected();
+      break;
+      
+    case STATE_EXIT_GATE_OPENING:
+      handleExitGateOpening();
+      break;
+      
+    case STATE_EXIT_VEHICLE_PASSING:
+      handleExitVehiclePassing();
+      break;
+      
+    default:
+      exitState = STATE_IDLE;
+      break;
+  }
+}
+
 // ================= LOOP =================
 void loop() {
   mqtt.loop();
@@ -582,49 +858,52 @@ void loop() {
     return;
   }
 
-  // Reset RC522 dinh ky de tranh bi dong bang
-  static unsigned long lastRfidReset = 0;
-  static int noCardCount = 0;
-  if (!rfid.PICC_IsNewCardPresent()) {
-    noCardCount++;
-    if (noCardCount >= 20) {  // Sau ~1s khong co the → reset
-      noCardCount = 0;
-      rfid.PCD_Init();
-    }
-    return;
-  }
-  noCardCount = 0;
-  if (!rfid.PICC_ReadCardSerial()) {
-    rfid.PCD_Init();  // Reset neu doc that bai
-    return;
-  }
+  // Xử lý máy trạng thái cổng vào và cổng ra
+  processEntryStateMachine();
+  processExitStateMachine();
 
-  String uid = readUID();
-  Serial.print("The quet: ");
-  Serial.println(uid);
-  beepSuccess();  // Beep mỗi khi đọc thẻ thành công
-
-  if (isVehicleDetected(IR_GATE_OUT)) {
-    // CỔNG RA
-    if (isCheckedIn(uid)) {
-      beepSuccess();  // Báo hiệu thành công
-      openGateOut();
-      checkOutUID(uid);  // Xóa UID khỏi danh sách sau khi xe ra
-    } else {
-      beepError();  // Báo hiệu lỗi
-      Serial.println("❌ The khong hop le hoac chua check-in!");
+  // Chỉ đọc thẻ RFID khi đang ở trạng thái IDLE
+  if (entryState == STATE_IDLE && exitState == STATE_IDLE) {
+    if (!rfid.PICC_IsNewCardPresent()) {
+      return;  // Không có thẻ mới
     }
     
-  } else if (isVehicleDetected(IR_GATE_IN)) {
-    // === CỔNG VÀO: Đọc được thẻ là mở ===
-    openGateIn();
-  }
-  // Lưu ý: Không cần else để báo lỗi khi không có xe ở cổng
-  // → Cho phép người dùng quét thẻ trước rồi mới lái xe vào
+    if (!rfid.PICC_ReadCardSerial()) {
+      return;  // Không đọc được dữ liệu thẻ
+    }
 
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
-  delay(1000);
+    String uid = readUID();
+    Serial.print("The quet: ");
+    Serial.println(uid);
+    beepSuccess();
+
+    // Lưu UID hiện tại
+    currentUID = uid;
+
+    // Xác định cổng nào (vào hay ra)
+    if (isVehicleDetected(IR_GATE_OUT)) {
+      // CỔNG RA
+      Serial.println("📍 Vi tri: Cong RA");
+      exitState = STATE_EXIT_CARD_DETECTED;
+      exitStateStartTime = millis();
+      
+    } else if (isVehicleDetected(IR_GATE_IN)) {
+      // CỔNG VÀO
+      Serial.println("📍 Vi tri: Cong VAO");
+      entryState = STATE_ENTRY_CARD_DETECTED;
+      entryStateStartTime = millis();
+      
+    } else {
+      // Không phát hiện xe ở cả 2 cổng
+      beepError();
+      Serial.println("❌ Khong phat hien xe o cong!");
+      currentUID = "";
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    delay(500);
+  }
 }
 
 // Đọc UID từ thẻ RFID
@@ -780,7 +1059,9 @@ void updateSlot() {
   }
 }
 
-// Mở cổng vào
+// ================= CÁC HÀM CŨ (ĐÃ ĐƯỢC THAY THẾ BỞI STATE MACHINE) =================
+/*
+// Mở cổng vào (ĐÃ THAY THẾ BỞI handleEntryGateOpening và handleEntryVehiclePassing)
 void openGateIn() {
   Serial.println("✅ Mo cong vao");
   servoIn.write(GATE_OPEN_ANGLE);
@@ -789,7 +1070,7 @@ void openGateIn() {
   Serial.println("Dong cong vao");
 }
 
-// Mở cổng ra
+// Mở cổng ra (ĐÃ THAY THẾ BỞI handleExitGateOpening và handleExitVehiclePassing)
 void openGateOut() {
   Serial.println("🚗 Mo cong ra");
   servoOut.write(GATE_OPEN_ANGLE);
@@ -797,3 +1078,4 @@ void openGateOut() {
   servoOut.write(GATE_CLOSE_ANGLE);
   Serial.println("Dong cong ra");
 }
+*/
